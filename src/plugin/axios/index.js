@@ -3,7 +3,7 @@ import axios from 'axios'
 import { Message } from 'element-ui-eoi'
 import util from '@/libs/util'
 import router from '@/router'
-import { isPlainObject, get } from 'lodash'
+import { isPlainObject, get, has } from 'lodash'
 import { blobToString, hasOwnProperty } from '@/libs/util.common'
 import { INVALID_SESSION } from '@/plugin/auth'
 
@@ -52,23 +52,55 @@ const service = axios.create({
   },
 })
 
+class ProtectedRequestCancelTokens {
+  #tokenList = {}
+
+  add (key, func) {
+    this.#tokenList[key] = func
+  }
+
+  remove (key) {
+    delete this.#tokenList[key]
+  }
+
+  cancelAllRequest () {
+    for (const uniqid of Object.keys(this.#tokenList)) {
+      this.#tokenList[uniqid]('invalid session')
+    }
+    this.#tokenList = {}
+  }
+}
+
+const rrct = new ProtectedRequestCancelTokens()
+
 // 请求拦截器
 service.interceptors.request.use(
   config => {
     if (get(config, 'authorization') === false) {
       return config
     }
+    // 请求唯一id
+    config.__uniqid = `${config.url}-${new Date().getTime()}`
+    // 需要鉴权
+    config.__permission = false
     // 处理鉴权
     const token = util.cookies.get('token')
     const uuid = util.cookies.get('uuid')
     let authorization = ''
     if (token && uuid) {
       authorization += `TK="${token}" `
+      config.__permission = true
     }
     if (store.state.d2admin.config.machine) {
       authorization += `MC="${store.state.d2admin.config.machine}" `
     }
     config.headers.Authorization = `Bearer ${authorization}`.trim()
+    if (config.__permission) {
+      // 注册取消令牌
+      config.cancelToken = new axios.CancelToken(function executor (canceler) {
+        rrct.add(config.__uniqid, canceler)
+      })
+    }
     return config
   },
   error => {
@@ -81,26 +113,42 @@ service.interceptors.request.use(
 // 响应拦截器
 service.interceptors.response.use(
   response => {
+    // 注销取消令牌
+    if (has(response, 'config.__uniqid')) {
+      rrct.remove(response.config.__uniqid)
+    }
     // 更新用户会话Token
     if (hasOwnProperty(response.headers, 'x-uuid') && hasOwnProperty(response.headers, 'x-token')) {
       util.cookies.set('uuid', response.headers['x-uuid'])
       util.cookies.set('token', response.headers['x-token'])
       // todo 刷新用户远程状态
     }
-    if (response.request.responseType === 'blob' || response.data instanceof Blob) {
+    if (!get(response, 'config.extractData', true)
+      || response.request.responseType === 'blob'
+      || response.data instanceof Blob
+    ) {
       return response
     }
     // 直接抽取 axios 返回数据中的 data
     return response.data
   },
   async error => {
+    if (axios.isCancel(error)) {
+      throw new Error(`request canceled: ${error.message}`)
+    }
+    // 注销取消令牌
+    if (has(error, 'config.__uniqid')) {
+      rrct.remove(error.config.__uniqid)
+    }
     // 静默异常标志
-    const silent = !!error.config.silent
+    const silent = !!get(error, 'config.silent', false)
     // 响应处理分支
     if (error.response === undefined) {
       throw error
     }
     if (error.response.status === 401) {
+      // 取消所有请求
+      rrct.cancelAllRequest()
       // 删除cookie
       util.cookies.remove('token')
       util.cookies.remove('uuid')
@@ -113,11 +161,12 @@ service.interceptors.response.use(
           status: INVALID_SESSION,
         },
       })
-      Message({
-        message: '登录状态过期，请重新登录！',
-        type: 'warning',
-        duration: 5 * 1000,
-      })
+      if (!silent) {
+        Message({
+          message: '登录状态过期，请重新登录！',
+          type: 'warning',
+        })
+      }
       throw error
     }
     // 异常处理分支
